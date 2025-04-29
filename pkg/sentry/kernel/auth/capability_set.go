@@ -15,26 +15,15 @@
 package auth
 
 import (
-	"encoding/binary"
-	"fmt"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/log"
 )
 
 // A CapabilitySet is a set of capabilities implemented as a bitset. The zero
 // value of CapabilitySet is a set containing no capabilities.
 type CapabilitySet uint64
-
-// VfsCapData is equivalent to Linux's cpu_vfs_cap_data, defined
-// in Linux's include/linux/capability.h.
-type VfsCapData struct {
-	MagicEtc    uint32
-	RootID      uint32
-	Permitted   CapabilitySet
-	Inheritable CapabilitySet
-}
 
 // AllCapabilities is a CapabilitySet containing all valid capabilities.
 var AllCapabilities = CapabilitySetOf(linux.CAP_LAST_CAP+1) - 1
@@ -57,38 +46,31 @@ func CapabilitySetOfMany(cps []linux.Capability) CapabilitySet {
 // VfsCapDataOf returns a VfsCapData containing the file capabilities for the given slice of bytes.
 // For each field of the cap data, which are in the structure of either vfs_cap_data or vfs_ns_cap_data,
 // the bytes are ordered in little endian.
-func VfsCapDataOf(data []byte) (VfsCapData, error) {
-	var capData VfsCapData
+func VfsCapDataOf(data []byte) (linux.VfsNsCapData, error) {
 	size := len(data)
-	if size < linux.XATTR_CAPS_SZ_1 {
-		return capData, fmt.Errorf("the size of security.capability is too small, actual size: %v", size)
+	if size != linux.XATTR_CAPS_SZ_2 && size != linux.XATTR_CAPS_SZ_3 {
+		log.Warningf("the size of security.capability is invalid, actual size: %d", size)
+		return linux.VfsNsCapData{}, linuxerr.EINVAL
 	}
-	capData.MagicEtc = binary.LittleEndian.Uint32(data[:4])
-	capData.Permitted = CapabilitySet(binary.LittleEndian.Uint32(data[4:8]))
-	capData.Inheritable = CapabilitySet(binary.LittleEndian.Uint32(data[8:12]))
-	// The version of the file capabilities takes first 4 bytes of the given
-	// slice.
-	version := capData.MagicEtc & linux.VFS_CAP_REVISION_MASK
-	switch {
-	case version == linux.VFS_CAP_REVISION_3 && size >= linux.XATTR_CAPS_SZ_3:
-		// Like version 2 file capabilities, version 3 capability
-		// masks are 64 bits in size.  In addition, version 3 has
-		// the root user ID of namespace, which is encoded in the
-		// security.capability extended attribute.
-		capData.RootID = binary.LittleEndian.Uint32(data[20:24])
-		fallthrough
-	case version == linux.VFS_CAP_REVISION_2 && size >= linux.XATTR_CAPS_SZ_2:
-		capData.Permitted += CapabilitySet(binary.LittleEndian.Uint32(data[12:16])) << 32
-		capData.Inheritable += CapabilitySet(binary.LittleEndian.Uint32(data[16:20])) << 32
-	default:
-		return VfsCapData{}, fmt.Errorf("VFS_CAP_REVISION_%v with cap data size %v is not supported", version, size)
+	var capData linux.VfsNsCapData
+	if size == linux.XATTR_CAPS_SZ_3 {
+		capData.UnmarshalUnsafe(data)
+	} else {
+		capData.VfsCapData.UnmarshalUnsafe(data)
+		// rootid = 0 is correct for version 2 file capabilities.
+	}
+	// See security/commoncap.c:validheader().
+	if sansflags := capData.MagicEtc & ^uint32(linux.VFS_CAP_FLAGS_EFFECTIVE); (size == linux.XATTR_CAPS_SZ_2 && sansflags != linux.VFS_CAP_REVISION_2) ||
+		(size == linux.XATTR_CAPS_SZ_3 && sansflags != linux.VFS_CAP_REVISION_3) {
+		log.Warningf("the magic header of security.capability is invalid, actual value: %#x", capData.MagicEtc)
+		return linux.VfsNsCapData{}, linuxerr.EINVAL
 	}
 	return capData, nil
 }
 
 // CapsFromVfsCaps returns a copy of the given creds with new capability sets
 // by applying the file capability that is specified by capData.
-func CapsFromVfsCaps(capData VfsCapData, creds *Credentials) (*Credentials, error) {
+func CapsFromVfsCaps(capData linux.VfsNsCapData, creds *Credentials) (*Credentials, error) {
 	// If the real or effective user ID of the process is root,
 	// the file inheritable and permitted sets are ignored from
 	// `Capabilities and execution of programs by root` at capabilities(7).
@@ -96,8 +78,8 @@ func CapsFromVfsCaps(capData VfsCapData, creds *Credentials) (*Credentials, erro
 		return creds, nil
 	}
 	effective := (capData.MagicEtc & linux.VFS_CAP_FLAGS_EFFECTIVE) > 0
-	permittedCaps := (capData.Permitted & creds.BoundingCaps) |
-		(capData.Inheritable & creds.InheritableCaps)
+	permittedCaps := (CapabilitySet(capData.Permitted()) & creds.BoundingCaps) |
+		(CapabilitySet(capData.Inheritable()) & creds.InheritableCaps)
 	// P'(effective) = effective ? P'(permitted) : P'(ambient).
 	// The ambient capabilities has not supported yet in gVisor,
 	// set effective capabilities to 0 when effective bit is false.
@@ -106,7 +88,7 @@ func CapsFromVfsCaps(capData VfsCapData, creds *Credentials) (*Credentials, erro
 		effectiveCaps = permittedCaps
 	}
 	// Insufficient to execute correctly.
-	if (capData.Permitted & ^permittedCaps) != 0 {
+	if (CapabilitySet(capData.Permitted()) & ^permittedCaps) != 0 {
 		return nil, linuxerr.EPERM
 	}
 	// If the capabilities don't change, it will return the creds'
@@ -119,6 +101,77 @@ func CapsFromVfsCaps(capData VfsCapData, creds *Credentials) (*Credentials, erro
 	newCreds.PermittedCaps = permittedCaps
 	newCreds.EffectiveCaps = effectiveCaps
 	return newCreds, nil
+}
+
+// FixupVfsCapDataOnSet may convert the given value to v3 file capabilities. It
+// is analogous to security/commoncap.c:cap_convert_nscap().
+func FixupVfsCapDataOnSet(creds *Credentials, value string, kuid KUID, kgid KGID) (string, error) {
+	vfsCaps, err := VfsCapDataOf([]byte(value))
+	if err != nil {
+		return "", err
+	}
+	if !creds.HasCapabilityOnFile(linux.CAP_SETFCAP, kuid, kgid) {
+		return "", linuxerr.EPERM
+	}
+	if vfsCaps.IsRevision2() && creds.HasCapabilityIn(linux.CAP_SETFCAP, creds.UserNamespace.Root()) {
+		// The user is privileged, allow the v2 write.
+		return value, nil
+	}
+	// Linux does the following UID gymnastics:
+	//   1. The userspace-provided rootID is relative to the caller's user
+	//      namespace. So vfsCaps.RootID is mapped down to KUID first.
+	//   2. If this is an ID-mapped mount, the result is mapped up using the
+	//      ID-map and then down again using the filesystem's owning user
+	//      namespace (inode->i_sb->s_user_ns). We again have a KUID result.
+	//   3. The result is mapped up using the filesystem's owning user namespace.
+	//
+	// The final result is saved in the xattr value at vfs_ns_cap_data->rootid.
+	// Since gVisor does not support ID-mapped mounts and all filesystems are
+	// owned by the initial user namespace, we can skip steps 2 and 3.
+	rootID := creds.UserNamespace.MapToKUID(UID(vfsCaps.RootID))
+	if !rootID.Ok() {
+		return "", linuxerr.EINVAL
+	}
+	vfsCaps.ConvertToV3(uint32(rootID))
+	return vfsCaps.ToString(), nil
+}
+
+// FixupVfsCapDataOnGet may convert the given value to v2 file capabilities. It
+// is analogous to security/commoncap.c:cap_inode_getsecurity().
+func FixupVfsCapDataOnGet(creds *Credentials, value string) (string, error) {
+	vfsCaps, err := VfsCapDataOf([]byte(value))
+	if err != nil {
+		return "", err
+	}
+	// Linux does the steps mentioned in FixupVfsCapDataOnSet in reverse. But
+	// since gVisor does not support ID-mapped mounts and all filesystems are
+	// owned by the initial user namespace, we only need to reverse step 1 here.
+	rootID := KUID(vfsCaps.RootID)
+	mappedRoot := creds.UserNamespace.MapFromKUID(rootID)
+	if mappedRoot.Ok() && mappedRoot != RootUID {
+		// Return this as v3.
+		vfsCaps.ConvertToV3(uint32(mappedRoot))
+		return vfsCaps.ToString(), nil
+	}
+	if !rootIDOwnsCurrentUserns(creds, rootID) {
+		return "", linuxerr.EOVERFLOW
+	}
+	// Return this as v2.
+	vfsCaps.ConvertToV2()
+	return vfsCaps.ToString(), nil
+}
+
+// Analogous to security/commoncap.c:rootid_owns_currentns().
+func rootIDOwnsCurrentUserns(creds *Credentials, rootID KUID) bool {
+	if !rootID.Ok() {
+		return false
+	}
+	for ns := creds.UserNamespace; ns != nil; ns = ns.parent {
+		if ns.MapFromKUID(rootID) == RootUID {
+			return true
+		}
+	}
+	return false
 }
 
 // TaskCapabilities represents all the capability sets for a task. Each of these

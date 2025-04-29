@@ -155,6 +155,9 @@ func (ns *UserNamespace) SetUIDMap(ctx context.Context, entries []IDMapEntry) er
 			return linuxerr.EPERM
 		}
 	}
+	if !ns.verifyRootUserMapping(c, entries) {
+		return linuxerr.EPERM
+	}
 	// trySetUIDMap leaves data in maps if it fails.
 	if err := ns.trySetUIDMap(entries); err != nil {
 		ns.uidMapFromParent.RemoveAll()
@@ -162,6 +165,31 @@ func (ns *UserNamespace) SetUIDMap(ctx context.Context, entries []IDMapEntry) er
 		return err
 	}
 	return nil
+}
+
+// verifyRootUserMapping ensures that if the parent's UID 0 is being mapped,
+// then the parent has CAP_SETFCAP because the child will be able to write
+// file capabilities that are valid in ancestor user namespaces.
+//
+// This is analogous to kernel/user_namespace.c:verify_root_map().
+func (ns *UserNamespace) verifyRootUserMapping(c *Credentials, entries []IDMapEntry) bool {
+	foundRoot := false
+	for _, e := range entries {
+		if e.FirstParentID == 0 {
+			foundRoot = true
+			break
+		}
+	}
+	if !foundRoot {
+		return true
+	}
+	if c.UserNamespace == ns {
+		// Process is writing to its own uid_map. Check that the parent had
+		// CAP_SETFCAP when ns was created.
+		return ns.parentHadSetfcap
+	}
+	// The writer is in the parent user namespace. It should have CAP_SETFCAP.
+	return c.HasCapability(linux.CAP_SETFCAP)
 }
 
 func (ns *UserNamespace) trySetUIDMap(entries []IDMapEntry) error {
