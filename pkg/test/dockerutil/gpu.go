@@ -296,7 +296,7 @@ func newCudaVersionFromOutput(out string) (*CudaVersion, error) {
 
 // MaxSuportedCUDAVersion returns the maximum supported by the host machine.
 func MaxSuportedCUDAVersion(ctx context.Context, t *testing.T) (*CudaVersion, error) {
-	c := MakeContainer(ctx, t)
+	c := MakeNativeContainer(ctx, t)
 	defer c.CleanUp(ctx)
 	opts, err := GPURunOpts(SniffGPUOpts{
 		DisableSnifferReason: "Get CUDA Version",

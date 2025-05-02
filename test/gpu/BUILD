@@ -84,8 +84,25 @@ go_test(
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/test/dockerutil",
-        "//pkg/test/testutil",
-        "@org_golang_x_sync//errgroup:go_default_library",
+        "//test/gpu/cuda",
+    ],
+)
+
+go_test(
+    name = "cuda_12_8_test",
+    timeout = "eternal",  # YES_I_REALLY_NEED_AN_ETERNAL_TEST
+    srcs = ["cuda_12_8_test.go"],
+    # runsc is needed to invalidate the bazel cache in case of any code changes.
+    data = ["//runsc"],
+    tags = [
+        "manual",
+        "noguitar",
+        "notap",
+    ],
+    visibility = ["//:sandbox"],
+    deps = [
+        "//pkg/test/dockerutil",
+        "//test/gpu/cuda",
     ],
 )
 
