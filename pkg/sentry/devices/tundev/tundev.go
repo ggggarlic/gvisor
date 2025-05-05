@@ -97,7 +97,7 @@ func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		if err != nil {
 			return 0, err
 		}
-		return 0, fd.device.SetIff(stack.Stack, req.Name(), flags)
+		return 0, fd.device.SetIff(ctx, stack.Stack, req.Name(), flags)
 
 	case linux.TUNGETIFF:
 		var req linux.IFReq
