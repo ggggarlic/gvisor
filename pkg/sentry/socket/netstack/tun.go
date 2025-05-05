@@ -17,6 +17,7 @@ package netstack
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/tcpip/link/tun"
 )
 
@@ -32,6 +33,9 @@ func TUNFlagsToLinux(flags tun.Flags) uint16 {
 	if flags.NoPacketInfo {
 		ret |= linux.IFF_NO_PI
 	}
+	if flags.Exclusive {
+		ret |= linux.IFF_TUN_EXCL
+	}
 	return ret
 }
 
@@ -40,12 +44,14 @@ func LinuxToTUNFlags(flags uint16) (tun.Flags, error) {
 	// Linux adds IFF_NOFILTER (the same value as IFF_NO_PI unfortunately)
 	// when there is no sk_filter. See __tun_chr_ioctl() in
 	// net/drivers/tun.c.
-	if flags&^uint16(linux.IFF_TUN|linux.IFF_TAP|linux.IFF_NO_PI|linux.IFF_ONE_QUEUE) != 0 {
+	if flags&^uint16(linux.IFF_TUN|linux.IFF_TAP|linux.IFF_NO_PI|linux.IFF_ONE_QUEUE|linux.IFF_TUN_EXCL) != 0 {
+		log.Warningf("Unsupported TUN flags: %x", flags)
 		return tun.Flags{}, linuxerr.EINVAL
 	}
 	return tun.Flags{
 		TUN:          flags&linux.IFF_TUN != 0,
 		TAP:          flags&linux.IFF_TAP != 0,
 		NoPacketInfo: flags&linux.IFF_NO_PI != 0,
+		Exclusive:    flags&linux.IFF_TUN_EXCL != 0,
 	}, nil
 }
